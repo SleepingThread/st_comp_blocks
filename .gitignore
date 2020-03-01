@@ -1,0 +1,10 @@
+doc/build
+rsync_exclude
+sync_local_st_qsar
+init_l5630_st_qsar
+synckey_local_st_qsar
+initkey_l5630_st_qsar
+.*
+*.egg-info
+*.pyc
+!.gitignore
