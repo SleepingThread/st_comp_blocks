@@ -8,8 +8,6 @@ try:
 except ImportError:
     import urllib.parse as urlparse
 
-import sqlalchemy
-from sqlalchemy import create_engine
 import pandas as pd
 
 import psycopg2
@@ -21,30 +19,28 @@ class SQL(object):
     def __init__(self, address):
         self.address = address
 
-        """
         _parse = urlparse.urlparse(address)
         self.connection = psycopg2.connect(dbname=_parse.path[1:],
                                            user=_parse.username,
                                            host=_parse.hostname,
                                            port=_parse.port)
         self.connection.autocommit = True
-        """
+        self.cursor = self.connection.cursor()
 
-        self.engine = create_engine(address)
-        self.connection = self.engine.connect()
         self.cur_result = None
         return
         
-    def __call__(self, request, **kwargs):
+    def __call__(self, request, args=None):
         con = self.connection
         if con.closed:
             con.connect()
 
-        self.cur_result = con.execute(sqlalchemy.text(request), **kwargs)
+        self.cursor.execute(request, args)
+        self.cur_result = self.cursor.fetchall()
         return self
     
     def to_pandas(self):
-        _keys = self.cur_result.keys()
+        _keys = [_el[0] for _el in self.cursor.description]
         if len(_keys) > 0:
             _rows = [_row for _row in self.cur_result]
             _rows = _rows if len(_rows) != 0 else None
@@ -65,7 +61,7 @@ class SQL(object):
         if self.cur_result is None:
             return -1
         else:
-            return self.cur_result.rowcount
+            return len(self.cur_result)
 
     def show_active_connections(self):
         return self("SELECT * FROM pg_stat_activity")
@@ -129,9 +125,9 @@ class CBStorage(object):
     ################################################
 
     def load(self, block_id):
-        query = "update %s set read_date=current_timestamp where id=:id_value;" \
-                "select * from %s where id=:id_value;" % (self.table_name, self.table_name)
-        _res = self.sql(query, table_name=self.table_name, id_value=block_id)
+        query = "update %s set read_date=current_timestamp where id=%%(id_value)s;" \
+                "select * from %s where id=%%(id_value)s;" % (self.table_name, self.table_name)
+        _res = self.sql(query, dict(table_name=self.table_name, id_value=block_id))
         if _res.rowcount == 0:
             raise ValueError("No such block_id: %s" % str(block_id))
 
@@ -153,17 +149,16 @@ class CBStorage(object):
         """
         if block_id is None:
             query = "insert into %s (json, bin)" \
-                    " values (:json_value, :bin_value) returning id;" % self.table_name
-            ids = self.sql(query,
-                           json_value=psycopg2.extras.Json(block_json),
-                           bin_value=psycopg2.Binary(block_binary)).to_pandas()
+                    " values (%%(json_value)s, %%(bin_value)s) returning id;" % self.table_name
+            ids = self.sql(query, dict(json_value=psycopg2.extras.Json(block_json),
+                                       bin_value=psycopg2.Binary(block_binary))).to_pandas()
             return ids['id'].values
         else:
-            query = "update {} set json=:json_value, bin=:bin_value, "\
-                    "update_date=current_timestamp where id=:block_id;" % self.table_name
-            self.sql(query,
-                     json_value=psycopg2.extras.Json(block_json),
-                     bin_value=psycopg2.Binary(block_binary), block_id=block_id)
+            query = "update %s set json=%%(json_value)s, bin=%%(bin_value)s, "\
+                    "update_date=current_timestamp where id=%%(block_id)s;" % self.table_name
+            self.sql(query, dict(json_value=psycopg2.extras.Json(block_json),
+                                 bin_value=psycopg2.Binary(block_binary),
+                                 block_id=block_id))
             return [block_id]
 
     ################################################

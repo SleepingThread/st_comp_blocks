@@ -35,7 +35,6 @@ setup(name='st_comp_blocks',
       packages=find_packages(),
       # ext_modules = cythonize(extensions),
       install_requires=[
-          "sqlalchemy",
           "pandas",
           "numpy",
           "psycopg2"
