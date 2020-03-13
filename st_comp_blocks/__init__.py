@@ -36,7 +36,8 @@ class SQL(object):
             con.connect()
 
         self.cursor.execute(request, args)
-        self.cur_result = self.cursor.fetchall()
+        _descr = self.cursor.description
+        self.cur_result = self.cursor.fetchall() if _descr is not None else None
         return self
     
     def to_pandas(self):
@@ -230,6 +231,7 @@ class ComputationalBlock(object):
     
     @classmethod
     def load(cls, storage, block_id, strict=True, full=True):
+        block_id = int(block_id)
         res = storage.load(block_id).to_pandas()
         _json = res['json'][0]
         _json['id'] = block_id
