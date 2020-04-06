@@ -22,6 +22,7 @@ class SQL(object):
         _parse = urlparse.urlparse(address)
         self.connection = psycopg2.connect(dbname=_parse.path[1:],
                                            user=_parse.username,
+                                           password=_parse.password,
                                            host=_parse.hostname,
                                            port=_parse.port)
         self.connection.autocommit = True
@@ -217,10 +218,10 @@ class ComputationalBlock(object):
         return
     
     def save(self, update=True):
-        _id = self.id if update else None
+        _id = self.id
         if not update and _id is not None:
             self.id_history.append(_id)
-            self.id = None
+            _id = self.id = None
         self.id = int(self.storage.save(
             self.get_json(), self.get_binary(),
             block_id=_id)[0])
