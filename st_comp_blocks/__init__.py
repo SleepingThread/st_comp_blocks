@@ -13,6 +13,7 @@ import pandas as pd
 import psycopg2
 import psycopg2.extras
 import psycopg2.sql
+import psycopg2.extensions
 
 
 class SQL(object):
@@ -42,6 +43,9 @@ class SQL(object):
         return self
     
     def to_pandas(self):
+        if self.cursor.description is None:
+            return None
+
         _keys = [_el[0] for _el in self.cursor.description]
         if len(_keys) > 0:
             _rows = [_row for _row in self.cur_result]
@@ -93,6 +97,18 @@ class CBStorage(object):
         self.table_name = table_name
         
         self.sql = SQL(db_path)
+        self.initialize()
+        return
+
+    def initialize(self):
+        self.sql(
+            "create or replace function check_patch(pl integer, dbpl integer, key text) returns void as $$\n"
+            "begin\n"
+            "if pl != dbpl then\n"
+            "raise exception 'Patch for %: len(%)!=patch start position : %!=%', key, key, dbpl, pl;\n"
+            "end if;\n"
+            "end; $$ language plpgsql;"
+        )
         return
 
     def close(self):
@@ -126,15 +142,103 @@ class CBStorage(object):
     # Save/load methods
     ################################################
 
-    def load(self, block_id):
-        query = "update %s set read_date=current_timestamp where id=%%(id_value)s;" \
-                "select * from %s where id=%%(id_value)s;" % (self.table_name, self.table_name)
-        _res = self.sql(query, dict(table_name=self.table_name, id_value=block_id))
+    def _load(self, what, block_id):
+        query = "update %%(table_name)s set read_date=current_timestamp where id=%%(id_value)s;" \
+                "select %s from %%(table_name)s where id=%%(id_value)s;" % what
+        _res = self.sql(query, dict(table_name=psycopg2.extensions.AsIs(self.table_name), id_value=block_id))
         if _res.rowcount == 0:
             raise ValueError("No such block_id: %s" % str(block_id))
 
         return _res
-    
+
+    def load_json(self, block_id):
+        return self._load("json", block_id)
+
+    def load_binary(self, block_id):
+        return self._load("binary", block_id)
+
+    def load(self, block_id):
+        return self._load("*", block_id)
+
+    def pull_patch_props(self, patch_names, last_patches, block_id):
+        """
+        From json column load patch-props with patch_names updates
+            (positions after last_patches)
+        """
+        _query = "select "
+        _lp = last_patches
+        for _ind, _pn in enumerate(patch_names):
+            _query += "jsonb_path_query_array(json->'%s', '$[%d to LAST]') as %s" % (_pn, _lp[_pn], _pn)
+            if _ind < len(patch_names)-1:
+                _query += ", "
+        _query += " from %s where id=%d;" % (self.table_name, block_id)
+        _res = self.sql(_query)
+        if _res.rowcount == 0:
+            raise ValueError("No such block_id: %s" % str(block_id))
+        return _res
+
+    def push_patch_props(self, patches, last_patches, block_id):
+        """
+        Update json column patch-props from patches. last_patches must be the length
+            of patch-props in storage.
+        """
+        # remove empty updates
+        patches = {_k: _val for _k, _val in patches.items() if len(_val) > 0}
+        _query = "begin;\n"
+        # first we need check-request: db_length == last_patches
+        _lp = last_patches
+        for _pn in patches:
+            _query += "select check_patch(%d, jsonb_array_length(json->'%s'), '%s')"\
+                      " from %s where id=%d;\n" % \
+                      (_lp[_pn], _pn, _pn, self.table_name, block_id)
+        for _pn in patches:
+            _query += "update %s set "\
+                      "json=jsonb_set(json, '{%s}', json->'%s' || %%(%s)s)"\
+                      "where id=%d;\n" % (self.table_name, _pn, _pn, _pn, block_id)
+        _query += "commit;"
+        _res = self.sql(_query, {_pn: psycopg2.extras.Json(_val) for _pn, _val in patches.items()})
+        return
+
+    def save_json(self, block_json, block_id=None):
+        """
+        Parameters
+        ==========
+        block_json: object
+            object we can dump to json format
+        block_id: int or None
+        """
+        if block_id is None:
+            query = "begin; insert into %s (json)" \
+                    " values (%%(json_value)s) returning id; commit;" % self.table_name
+            ids = self.sql(query, dict(json_value=psycopg2.extras.Json(block_json))).to_pandas()
+            return ids['id'].values
+        else:
+            query = "begin; update %s set json=%%(json_value)s, "\
+                    "update_date=current_timestamp where id=%%(block_id)s; commit;" % self.table_name
+            self.sql(query, dict(json_value=psycopg2.extras.Json(block_json),
+                                 block_id=block_id))
+            return [block_id]
+
+    def save_binary(self, block_binary, block_id=None):
+        """
+        Parameters
+        ==========
+        block_binary: binary str
+            binary data converted to string
+        block_id: int or None
+        """
+        if block_id is None:
+            query = "begin; insert into %s (bin)" \
+                    " values (%%(bin_value)s) returning id; commit;" % self.table_name
+            ids = self.sql(query, dict(bin_value=psycopg2.Binary(block_binary))).to_pandas()
+            return ids['id'].values
+        else:
+            query = "begin; update %s set bin=%%(bin_value)s, "\
+                    "update_date=current_timestamp where id=%%(block_id)s; commit;" % self.table_name
+            self.sql(query, dict(bin_value=psycopg2.Binary(block_binary),
+                                 block_id=block_id))
+            return [block_id]
+
     def save(self, block_json, block_binary, block_id=None):
         """
         Parameters
@@ -145,19 +249,19 @@ class CBStorage(object):
             binary data converted to string
         block_id: int or None
 
-        Todo
-        ====
+        Notes
+        =====
         make available lists in json and binary
         """
         if block_id is None:
-            query = "insert into %s (json, bin)" \
-                    " values (%%(json_value)s, %%(bin_value)s) returning id;" % self.table_name
+            query = "begin; insert into %s (json, bin)" \
+                    " values (%%(json_value)s, %%(bin_value)s) returning id; commit;" % self.table_name
             ids = self.sql(query, dict(json_value=psycopg2.extras.Json(block_json),
                                        bin_value=psycopg2.Binary(block_binary))).to_pandas()
             return ids['id'].values
         else:
-            query = "update %s set json=%%(json_value)s, bin=%%(bin_value)s, "\
-                    "update_date=current_timestamp where id=%%(block_id)s;" % self.table_name
+            query = "begin; update %s set json=%%(json_value)s, bin=%%(bin_value)s, "\
+                    "update_date=current_timestamp where id=%%(block_id)s; commit;" % self.table_name
             self.sql(query, dict(json_value=psycopg2.extras.Json(block_json),
                                  bin_value=psycopg2.Binary(block_binary),
                                  block_id=block_id))
@@ -181,13 +285,14 @@ class CBStorage(object):
         return self
     
     def clear_storage(self):
-        self.sql("delete from %s where id>-1;" % self.table_name)
-        self.sql("alter sequence %s_id_seq restart with 1" % self.table_name)
+        self.sql("begin; delete from %s where id>-1; alter"
+                 "alter sequence %s_id_seq restart with 1; commit;" %
+                 (self.table_name, self.table_name))
         return self
 
     def delete_ids(self, id_list):
         id_list = ", ".join([str(_id) for _id in id_list])
-        self.sql("delete from %s where id in (%s)" % (self.table_name, id_list))
+        self.sql("delete from %s where id in (%s);" % (self.table_name, id_list))
         return self
 
 
@@ -206,7 +311,8 @@ def calculate_timer(func):
 
 class ComputationalBlock(object):
     # computational block properties names list
-    cb_props = []
+    cb_props = set([])
+    patch_props = set([])
 
     def __init__(self, storage):
         self.storage = storage
@@ -215,18 +321,80 @@ class ComputationalBlock(object):
         self.time = None
 
         self._updates = None
+
+        # property for managing patch-updates (pulls, pushes)
+        self._last_patches = {_k: 0 for _k in self.__class__.patch_props}
         return
-    
-    def save(self, update=True):
+
+    def get_patch_props_json(self, updates_only=True):
+        _lp = self._last_patches
+        cls = self.__class__
+        if updates_only:
+            return {_k: getattr(self, _k)[_lp[_k]:] for _k in cls.patch_props}
+        return {_k: getattr(self, _k) for _k in cls.patch_props}
+
+    def _update_last_patches(self, names=None):
+        names = self.__class__.patch_props if names is None else names
+        _lp = self._last_patches
+        for _k in names:
+            _lp[_k] = len(getattr(self, _k))
+        return
+
+    def _set_patch_props(self, patches, updates_only=True):
+        cls = self.__class__
+        for _k, _p in patches.items():
+            assert _k in cls.patch_props
+            if updates_only:
+                getattr(self, _k).extend(_p)
+            else:
+                setattr(self, _k, _p)
+        return self
+
+    def push_patch_props(self, names=None):
+        names = self.__class__.patch_props if names is None else names
+        _pp = self.get_patch_props_json(updates_only=True)
+        _pp = {_k: _pp[_k] for _k in names}
+        self.storage.push_patch_props(_pp, self._last_patches, block_id=self.id)
+        self._update_last_patches(names=names)
+        return self
+
+    def pull_patch_props(self, names=None):
+        names = self.__class__.patch_props if names is None else names
+        _pp = self.storage.pull_patch_props(names, self._last_patches, block_id=self.id)
+        _pp = _pp.to_pandas()
+        _pp = {_n: _pp[_n][0] for _n in names}
+        self._set_patch_props(_pp, updates_only=True)
+        self._update_last_patches(names=names)
+        return self
+
+    def _pre_save(self, update=True):
         _id = self.id
         if not update and _id is not None:
             self.id_history.append(_id)
             _id = self.id = None
+        return _id
+
+    def save_json(self, update=True):
+        _id = self._pre_save(update=update)
+        self._update_last_patches()
+        self.id = int(self.storage.save_json(
+            self.get_json(), block_id=_id)[0])
+        return self
+
+    def save_binary(self, update=True):
+        _id = self._pre_save(update=update)
+        self.id = int(self.storage.save_binary(
+            self.get_binary(), block_id=_id)[0])
+        return self
+
+    def save(self, update=True):
+        _id = self._pre_save(update=update)
+        self._update_last_patches()
         self.id = int(self.storage.save(
             self.get_json(), self.get_binary(),
             block_id=_id)[0])
         return self
-    
+
     def _repr_html_(self):
         return self.to_pandas()._repr_html_()
     
@@ -237,8 +405,10 @@ class ComputationalBlock(object):
         _json = res['json'][0]
         _json['id'] = block_id
         _bin = res['bin'][0].tobytes()
-        return cls.from_json_binary(storage, _json, _bin,
+        _obj = cls.from_json_binary(storage, _json, _bin,
                                     strict=strict, full=full)
+        _obj._update_last_patches()
+        return _obj
 
     def test(self):
         _json = self.get_json()
