@@ -2,6 +2,7 @@ import time
 import json
 import warnings
 import importlib
+import concurrent.futures
 
 try:
     import urlparse
@@ -14,34 +15,89 @@ import psycopg2
 import psycopg2.extras
 import psycopg2.sql
 import psycopg2.extensions
+import psycopg2.errors
+
+
+def db_connect(address, timeout, on_connect=None):
+    _parse = urlparse.urlparse(address)
+    connection = psycopg2.connect(dbname=_parse.path[1:],
+                                  user=_parse.username,
+                                  password=_parse.password,
+                                  host=_parse.hostname,
+                                  port=_parse.port,
+                                  options="-c statement_timeout=%d" % int(timeout * 1000.))
+    connection.autocommit = True
+    cursor = connection.cursor()
+
+    on_connect = [] if on_connect is None else on_connect
+    for _req in on_connect:
+        cursor.execute(_req)
+
+    return connection, cursor
+
+
+def db_request(cursor, request, args):
+    cursor.execute(request, args)
+    return
 
 
 class SQL(object):
-    def __init__(self, address):
+    def __init__(self, address, timeout=120., connect_timeout=3.0):
         self.address = address
+        self.timeout = timeout
+        self.connect_timeout = connect_timeout
 
-        _parse = urlparse.urlparse(address)
-        self.connection = psycopg2.connect(dbname=_parse.path[1:],
-                                           user=_parse.username,
-                                           password=_parse.password,
-                                           host=_parse.hostname,
-                                           port=_parse.port)
-        self.connection.autocommit = True
-        self.cursor = self.connection.cursor()
+        self.on_connect_queries = []
+
+        self.connection = None
+        self.cursor = None
+
+        self.connect(connect_timeout)
 
         self.cur_result = None
         return
-        
-    def __call__(self, request, args=None):
-        con = self.connection
-        if con.closed:
-            con.connect()
 
-        self.cursor.execute(request, args)
+    def print_status(self):
+        print("conn_status: ", self.connection.status)
+        print("conn_closed: ", self.connection.closed)
+        return
+
+    def on_connect(self, query):
+        self.on_connect_queries.append(query)
+        return self
+
+    def connect(self, timeout=None):
+        timeout = self.connect_timeout if timeout is None else timeout
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        try:
+            _fut = executor.submit(db_connect, self.address, self.timeout,
+                                   self.on_connect_queries)
+            self.connection, self.cursor = _fut.result(timeout=timeout)
+        except (concurrent.futures.TimeoutError, psycopg2.errors.QueryCanceled):
+            raise TimeoutError("Connect failed on timeout: %.1f" % timeout)
+        finally:
+            executor.shutdown(wait=False)
+        return self
+
+    def __call__(self, request, args=None, timeout=None):
+        timeout = self.timeout if timeout is None else timeout
+
+        if self.connection.closed:
+            self.connect()
+
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        try:
+            _fut = executor.submit(db_request, self.cursor, request, args)
+            _fut.result(timeout=timeout)
+        except (concurrent.futures.TimeoutError, psycopg2.errors.QueryCanceled):
+            raise TimeoutError("Request failed on timeout: %.1f" % timeout)
+        finally:
+            executor.shutdown(wait=False)
+
         _descr = self.cursor.description
         self.cur_result = self.cursor.fetchall() if _descr is not None else None
         return self
-    
+
     def to_pandas(self):
         if self.cursor.description is None:
             return None
@@ -92,16 +148,16 @@ class CBStorage(object):
     );
     """
     
-    def __init__(self, db_path, table_name):
+    def __init__(self, db_path, table_name, timeout=120.0, connect_timeout=4.0):
         self.db_path = db_path
         self.table_name = table_name
         
-        self.sql = SQL(db_path)
+        self.sql = SQL(db_path, timeout=timeout, connect_timeout=connect_timeout)
         self.initialize()
         return
 
     def initialize(self):
-        self.sql(
+        self.sql.on_connect(
             "create or replace function check_patch(pl integer, dbpl integer, key text) returns void as $$\n"
             "begin\n"
             "if pl != dbpl then\n"
@@ -119,7 +175,7 @@ class CBStorage(object):
     # Storage visualizations
     ################################################
 
-    def select(self, what="*", where=None, order_by=None):
+    def select(self, what="*", where=None, order_by=None, timeout=None):
         _request = "select %s from %s" % (what, self.table_name)
         if where is not None:
             _request += " where %s" % where
@@ -127,40 +183,41 @@ class CBStorage(object):
         if order_by is not None:
             _request += " order by %s" % order_by
 
-        return self.sql(_request)
+        return self.sql(_request, timeout=timeout)
 
-    def show(self):
-        return self.select("*")
+    def show(self, timeout=None):
+        return self.select("*", timeout=timeout)
 
-    def show_class(self, cls, what="*", where=None, order_by=None):
+    def show_class(self, cls, what="*", where=None, order_by=None, timeout=None):
         _class_name = "%s.%s" % (cls.__module__, cls.__name__)
         _where = "json->>'__classname__' = '%s'" % _class_name
         where = "%s and %s" % (where, _where) if where else _where
-        return self.select(what, where, order_by)
+        return self.select(what, where, order_by, timeout=timeout)
 
     ################################################
     # Save/load methods
     ################################################
 
-    def _load(self, what, block_id):
+    def _load(self, what, block_id, timeout=None):
         query = "update %%(table_name)s set read_date=current_timestamp where id=%%(id_value)s;" \
                 "select %s from %%(table_name)s where id=%%(id_value)s;" % what
-        _res = self.sql(query, dict(table_name=psycopg2.extensions.AsIs(self.table_name), id_value=block_id))
+        _res = self.sql(query, dict(table_name=psycopg2.extensions.AsIs(self.table_name), id_value=block_id),
+                        timeout=timeout)
         if _res.rowcount == 0:
             raise ValueError("No such block_id: %s" % str(block_id))
 
         return _res
 
-    def load_json(self, block_id):
-        return self._load("json", block_id)
+    def load_json(self, block_id, timeout=None):
+        return self._load("json", block_id, timeout=timeout)
 
-    def load_binary(self, block_id):
-        return self._load("binary", block_id)
+    def load_binary(self, block_id, timeout=None):
+        return self._load("binary", block_id, timeout=timeout)
 
-    def load(self, block_id):
-        return self._load("*", block_id)
+    def load(self, block_id, timeout=None):
+        return self._load("*", block_id, timeout=timeout)
 
-    def pull_patch_props(self, patch_names, last_patches, block_id):
+    def pull_patch_props(self, patch_names, last_patches, block_id, timeout=None):
         """
         From json column load patch-props with patch_names updates
             (positions after last_patches)
@@ -172,12 +229,12 @@ class CBStorage(object):
             if _ind < len(patch_names)-1:
                 _query += ", "
         _query += " from %s where id=%d;" % (self.table_name, block_id)
-        _res = self.sql(_query)
+        _res = self.sql(_query, timeout=timeout)
         if _res.rowcount == 0:
             raise ValueError("No such block_id: %s" % str(block_id))
         return _res
 
-    def push_patch_props(self, patches, last_patches, block_id):
+    def push_patch_props(self, patches, last_patches, block_id, timeout=None):
         """
         Update json column patch-props from patches. last_patches must be the length
             of patch-props in storage.
@@ -196,10 +253,11 @@ class CBStorage(object):
                       "json=jsonb_set(json, '{%s}', json->'%s' || %%(%s)s)"\
                       "where id=%d;\n" % (self.table_name, _pn, _pn, _pn, block_id)
         _query += "commit;"
-        _res = self.sql(_query, {_pn: psycopg2.extras.Json(_val) for _pn, _val in patches.items()})
+        _res = self.sql(_query, {_pn: psycopg2.extras.Json(_val) for _pn, _val in patches.items()},
+                        timeout=timeout)
         return
 
-    def save_json(self, block_json, block_id=None):
+    def save_json(self, block_json, block_id=None, timeout=None):
         """
         Parameters
         ==========
@@ -210,16 +268,17 @@ class CBStorage(object):
         if block_id is None:
             query = "begin; insert into %s (json)" \
                     " values (%%(json_value)s) returning id; commit;" % self.table_name
-            ids = self.sql(query, dict(json_value=psycopg2.extras.Json(block_json))).to_pandas()
+            ids = self.sql(query, dict(json_value=psycopg2.extras.Json(block_json)),
+                           timeout=timeout).to_pandas()
             return ids['id'].values
         else:
             query = "begin; update %s set json=%%(json_value)s, "\
                     "update_date=current_timestamp where id=%%(block_id)s; commit;" % self.table_name
             self.sql(query, dict(json_value=psycopg2.extras.Json(block_json),
-                                 block_id=block_id))
+                                 timeout=timeout, block_id=block_id))
             return [block_id]
 
-    def save_binary(self, block_binary, block_id=None):
+    def save_binary(self, block_binary, block_id=None, timeout=None):
         """
         Parameters
         ==========
@@ -230,16 +289,17 @@ class CBStorage(object):
         if block_id is None:
             query = "begin; insert into %s (bin)" \
                     " values (%%(bin_value)s) returning id; commit;" % self.table_name
-            ids = self.sql(query, dict(bin_value=psycopg2.Binary(block_binary))).to_pandas()
+            ids = self.sql(query, dict(bin_value=psycopg2.Binary(block_binary)),
+                           timeout=timeout).to_pandas()
             return ids['id'].values
         else:
             query = "begin; update %s set bin=%%(bin_value)s, "\
                     "update_date=current_timestamp where id=%%(block_id)s; commit;" % self.table_name
             self.sql(query, dict(bin_value=psycopg2.Binary(block_binary),
-                                 block_id=block_id))
+                                 timeout=timeout, block_id=block_id))
             return [block_id]
 
-    def save(self, block_json, block_binary, block_id=None):
+    def save(self, block_json, block_binary, block_id=None, timeout=None):
         """
         Parameters
         ==========
@@ -257,21 +317,22 @@ class CBStorage(object):
             query = "begin; insert into %s (json, bin)" \
                     " values (%%(json_value)s, %%(bin_value)s) returning id; commit;" % self.table_name
             ids = self.sql(query, dict(json_value=psycopg2.extras.Json(block_json),
-                                       bin_value=psycopg2.Binary(block_binary))).to_pandas()
+                                       bin_value=psycopg2.Binary(block_binary)),
+                           timeout=timeout).to_pandas()
             return ids['id'].values
         else:
             query = "begin; update %s set json=%%(json_value)s, bin=%%(bin_value)s, "\
                     "update_date=current_timestamp where id=%%(block_id)s; commit;" % self.table_name
             self.sql(query, dict(json_value=psycopg2.extras.Json(block_json),
                                  bin_value=psycopg2.Binary(block_binary),
-                                 block_id=block_id))
+                                 block_id=block_id), timeout=timeout)
             return [block_id]
 
     ################################################
     # Storage manipulations
     ################################################
 
-    def create_storage(self):
+    def create_storage(self, timeout=None):
         self.sql("""
         create table if not exists %s (
         id bigserial not null primary key,
@@ -281,18 +342,19 @@ class CBStorage(object):
         update_date timestamp default current_timestamp,
         read_date timestamp default current_timestamp        
         );
-        """ % self.table_name)
+        """ % self.table_name, timeout=timeout)
         return self
     
-    def clear_storage(self):
+    def clear_storage(self, timeout=None):
         self.sql("begin; delete from %s where id>-1; alter"
                  "alter sequence %s_id_seq restart with 1; commit;" %
-                 (self.table_name, self.table_name))
+                 (self.table_name, self.table_name), timeout=timeout)
         return self
 
-    def delete_ids(self, id_list):
+    def delete_ids(self, id_list, timeout=None):
         id_list = ", ".join([str(_id) for _id in id_list])
-        self.sql("delete from %s where id in (%s);" % (self.table_name, id_list))
+        self.sql("delete from %s where id in (%s);" % (self.table_name, id_list),
+                 timeout=timeout)
         return self
 
 
@@ -350,17 +412,17 @@ class ComputationalBlock(object):
                 setattr(self, _k, _p)
         return self
 
-    def push_patch_props(self, names=None):
+    def push_patch_props(self, names=None, timeout=1.5):
         names = self.__class__.patch_props if names is None else names
         _pp = self.get_patch_props_json(updates_only=True)
         _pp = {_k: _pp[_k] for _k in names}
-        self.storage.push_patch_props(_pp, self._last_patches, block_id=self.id)
+        self.storage.push_patch_props(_pp, self._last_patches, block_id=self.id, timeout=timeout)
         self._update_last_patches(names=names)
         return self
 
-    def pull_patch_props(self, names=None):
+    def pull_patch_props(self, names=None, timeout=1.5):
         names = self.__class__.patch_props if names is None else names
-        _pp = self.storage.pull_patch_props(names, self._last_patches, block_id=self.id)
+        _pp = self.storage.pull_patch_props(names, self._last_patches, block_id=self.id, timeout=timeout)
         _pp = _pp.to_pandas()
         _pp = {_n: _pp[_n][0] for _n in names}
         self._set_patch_props(_pp, updates_only=True)
@@ -374,34 +436,34 @@ class ComputationalBlock(object):
             _id = self.id = None
         return _id
 
-    def save_json(self, update=True):
+    def save_json(self, update=True, timeout=None):
         _id = self._pre_save(update=update)
         self._update_last_patches()
         self.id = int(self.storage.save_json(
-            self.get_json(), block_id=_id)[0])
+            self.get_json(), block_id=_id, timeout=timeout)[0])
         return self
 
-    def save_binary(self, update=True):
+    def save_binary(self, update=True, timeout=None):
         _id = self._pre_save(update=update)
         self.id = int(self.storage.save_binary(
-            self.get_binary(), block_id=_id)[0])
+            self.get_binary(), block_id=_id, timeout=timeout)[0])
         return self
 
-    def save(self, update=True):
+    def save(self, update=True, timeout=None):
         _id = self._pre_save(update=update)
         self._update_last_patches()
         self.id = int(self.storage.save(
             self.get_json(), self.get_binary(),
-            block_id=_id)[0])
+            block_id=_id, timeout=timeout)[0])
         return self
 
     def _repr_html_(self):
         return self.to_pandas()._repr_html_()
     
     @classmethod
-    def load(cls, storage, block_id, strict=True, full=True):
+    def load(cls, storage, block_id, strict=True, full=True, timeout=None):
         block_id = int(block_id)
-        res = storage.load(block_id).to_pandas()
+        res = storage.load(block_id, timeout=timeout).to_pandas()
         _json = res['json'][0]
         _json['id'] = block_id
         _bin = res['bin'][0].tobytes()
@@ -498,19 +560,19 @@ class CBUpdate(object):
         self.binary = None
         return
 
-    def load(self):
-        res = self.storage.load(self.block_id).to_pandas()
+    def load(self, timeout=None):
+        res = self.storage.load(self.block_id, timeout=timeout).to_pandas()
         self.json = res['json'][0]
         self.binary = res['bin'][0]
         return self
 
-    def save(self):
-        self.storage.save(self.json, self.binary, block_id=self.block_id)
+    def save(self, timeout=None):
+        self.storage.save(self.json, self.binary, block_id=self.block_id, timeout=timeout)
         return self
 
-    def update(self, save=False):
+    def update(self, save=False, timeout=None):
         if self.json is None and self.binary is None:
-            self.load()
+            self.load(timeout=timeout)
 
         _update = self.make_update()
         if _update:
