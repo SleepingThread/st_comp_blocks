@@ -26,12 +26,13 @@ def db_connect(address, timeout, on_connect=None):
                                   host=_parse.hostname,
                                   port=_parse.port,
                                   options="-c statement_timeout=%d" % int(timeout * 1000.))
-    connection.autocommit = True
+    connection.autocommit = False
     cursor = connection.cursor()
 
     on_connect = [] if on_connect is None else on_connect
-    for _req in on_connect:
-        cursor.execute(_req)
+    with connection:
+        for _req in on_connect:
+            cursor.execute(_req)
 
     return connection, cursor
 
@@ -42,12 +43,12 @@ def db_request(cursor, request, args):
 
 
 class SQL(object):
-    def __init__(self, address, timeout=120., connect_timeout=3.0):
+    def __init__(self, address, timeout=120., connect_timeout=3.0, on_connect=None):
         self.address = address
         self.timeout = timeout
         self.connect_timeout = connect_timeout
 
-        self.on_connect_queries = []
+        self.on_connect_queries = [] if on_connect is None else on_connect
 
         self.connection = None
         self.cursor = None
@@ -62,10 +63,6 @@ class SQL(object):
         print("conn_closed: ", self.connection.closed)
         return
 
-    def on_connect(self, query):
-        self.on_connect_queries.append(query)
-        return self
-
     def connect(self, timeout=None):
         timeout = self.connect_timeout if timeout is None else timeout
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
@@ -74,7 +71,11 @@ class SQL(object):
                                    self.on_connect_queries)
             self.connection, self.cursor = _fut.result(timeout=timeout)
         except (concurrent.futures.TimeoutError, psycopg2.errors.QueryCanceled):
+            self.connection = self.cursor = None
             raise TimeoutError("Connect failed on timeout: %.1f" % timeout)
+        except Exception as e:
+            self.connection = self.cursor = None
+            raise e
         finally:
             executor.shutdown(wait=False)
         return self
@@ -90,9 +91,15 @@ class SQL(object):
             _fut = executor.submit(db_request, self.cursor, request, args)
             _fut.result(timeout=timeout)
         except (concurrent.futures.TimeoutError, psycopg2.errors.QueryCanceled):
+            self.connection.rollback()
             raise TimeoutError("Request failed on timeout: %.1f" % timeout)
+        except Exception as e:
+            self.connection.rollback()
+            raise e
         finally:
             executor.shutdown(wait=False)
+
+        self.connection.commit()
 
         _descr = self.cursor.description
         self.cur_result = self.cursor.fetchall() if _descr is not None else None
@@ -152,20 +159,19 @@ class CBStorage(object):
         self.db_path = db_path
         self.table_name = table_name
         
-        self.sql = SQL(db_path, timeout=timeout, connect_timeout=connect_timeout)
-        self.initialize()
+        self.sql = SQL(db_path, timeout=timeout, connect_timeout=connect_timeout,
+                       on_connect=self._get_on_connect())
         return
 
-    def initialize(self):
-        self.sql.on_connect(
+    def _get_on_connect(self):
+        return [
             "create or replace function check_patch(pl integer, dbpl integer, key text) returns void as $$\n"
             "begin\n"
             "if pl != dbpl then\n"
             "raise exception 'Patch for %: len(%)!=patch start position : %!=%', key, key, dbpl, pl;\n"
             "end if;\n"
             "end; $$ language plpgsql;"
-        )
-        return
+        ]
 
     def close(self):
         self.sql.close()
@@ -241,7 +247,7 @@ class CBStorage(object):
         """
         # remove empty updates
         patches = {_k: _val for _k, _val in patches.items() if len(_val) > 0}
-        _query = "begin;\n"
+        _query = ""
         # first we need check-request: db_length == last_patches
         _lp = last_patches
         for _pn in patches:
@@ -252,7 +258,6 @@ class CBStorage(object):
             _query += "update %s set "\
                       "json=jsonb_set(json, '{%s}', json->'%s' || %%(%s)s)"\
                       "where id=%d;\n" % (self.table_name, _pn, _pn, _pn, block_id)
-        _query += "commit;"
         _res = self.sql(_query, {_pn: psycopg2.extras.Json(_val) for _pn, _val in patches.items()},
                         timeout=timeout)
         return
@@ -266,14 +271,14 @@ class CBStorage(object):
         block_id: int or None
         """
         if block_id is None:
-            query = "begin; insert into %s (json)" \
-                    " values (%%(json_value)s) returning id; commit;" % self.table_name
+            query = "insert into %s (json)" \
+                    " values (%%(json_value)s) returning id;" % self.table_name
             ids = self.sql(query, dict(json_value=psycopg2.extras.Json(block_json)),
                            timeout=timeout).to_pandas()
             return ids['id'].values
         else:
-            query = "begin; update %s set json=%%(json_value)s, "\
-                    "update_date=current_timestamp where id=%%(block_id)s; commit;" % self.table_name
+            query = "update %s set json=%%(json_value)s, "\
+                    "update_date=current_timestamp where id=%%(block_id)s;" % self.table_name
             self.sql(query, dict(json_value=psycopg2.extras.Json(block_json),
                                  timeout=timeout, block_id=block_id))
             return [block_id]
@@ -287,14 +292,14 @@ class CBStorage(object):
         block_id: int or None
         """
         if block_id is None:
-            query = "begin; insert into %s (bin)" \
-                    " values (%%(bin_value)s) returning id; commit;" % self.table_name
+            query = "insert into %s (bin)" \
+                    " values (%%(bin_value)s) returning id;" % self.table_name
             ids = self.sql(query, dict(bin_value=psycopg2.Binary(block_binary)),
                            timeout=timeout).to_pandas()
             return ids['id'].values
         else:
-            query = "begin; update %s set bin=%%(bin_value)s, "\
-                    "update_date=current_timestamp where id=%%(block_id)s; commit;" % self.table_name
+            query = "update %s set bin=%%(bin_value)s, "\
+                    "update_date=current_timestamp where id=%%(block_id)s;" % self.table_name
             self.sql(query, dict(bin_value=psycopg2.Binary(block_binary),
                                  timeout=timeout, block_id=block_id))
             return [block_id]
@@ -314,15 +319,15 @@ class CBStorage(object):
         make available lists in json and binary
         """
         if block_id is None:
-            query = "begin; insert into %s (json, bin)" \
-                    " values (%%(json_value)s, %%(bin_value)s) returning id; commit;" % self.table_name
+            query = "insert into %s (json, bin)" \
+                    " values (%%(json_value)s, %%(bin_value)s) returning id;" % self.table_name
             ids = self.sql(query, dict(json_value=psycopg2.extras.Json(block_json),
                                        bin_value=psycopg2.Binary(block_binary)),
                            timeout=timeout).to_pandas()
             return ids['id'].values
         else:
-            query = "begin; update %s set json=%%(json_value)s, bin=%%(bin_value)s, "\
-                    "update_date=current_timestamp where id=%%(block_id)s; commit;" % self.table_name
+            query = "update %s set json=%%(json_value)s, bin=%%(bin_value)s, "\
+                    "update_date=current_timestamp where id=%%(block_id)s;" % self.table_name
             self.sql(query, dict(json_value=psycopg2.extras.Json(block_json),
                                  bin_value=psycopg2.Binary(block_binary),
                                  block_id=block_id), timeout=timeout)
@@ -346,8 +351,8 @@ class CBStorage(object):
         return self
     
     def clear_storage(self, timeout=None):
-        self.sql("begin; delete from %s where id>-1; alter"
-                 "alter sequence %s_id_seq restart with 1; commit;" %
+        self.sql("delete from %s where id>-1; "
+                 "alter sequence %s_id_seq restart with 1;" %
                  (self.table_name, self.table_name), timeout=timeout)
         return self
 
@@ -472,7 +477,7 @@ class ComputationalBlock(object):
         _obj._update_last_patches()
         return _obj
 
-    def test(self):
+    def test_computational_block(self):
         _json = self.get_json()
         _bin = self.get_binary()
         new_cb = self.__class__.from_json_binary(self.storage, _json, _bin)
