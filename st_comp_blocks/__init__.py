@@ -155,23 +155,30 @@ class CBStorage(object):
     );
     """
     
-    def __init__(self, db_path, table_name, timeout=120.0, connect_timeout=4.0):
+    def __init__(self, db_path, table_name, timeout=120.0, connect_timeout=4.0,
+                 mode="rw"):
         self.db_path = db_path
         self.table_name = table_name
+        self.mode = mode
         
         self.sql = SQL(db_path, timeout=timeout, connect_timeout=connect_timeout,
                        on_connect=self._get_on_connect())
         return
 
     def _get_on_connect(self):
-        return [
-            "create or replace function check_patch(pl integer, dbpl integer, key text) returns void as $$\n"
-            "begin\n"
-            "if pl != dbpl then\n"
-            "raise exception 'Patch for %: len(%)!=patch start position : %!=%', key, key, dbpl, pl;\n"
-            "end if;\n"
-            "end; $$ language plpgsql;"
-        ]
+        if self.mode == "rw":
+            return [
+                "create or replace function check_patch(pl integer, dbpl integer, key text) returns void as $$\n"
+                "begin\n"
+                "if pl != dbpl then\n"
+                "raise exception 'Patch for %: len(%)!=patch start position : %!=%', key, key, dbpl, pl;\n"
+                "end if;\n"
+                "end; $$ language plpgsql;"
+            ]
+        elif self.mode == "ro":
+            return []
+        else:
+            raise ValueError("Unrecognized mode value: %s. Sould be 'rw' or 'ro'." % self.mode)
 
     def close(self):
         self.sql.close()
