@@ -1,5 +1,6 @@
 import time
 import json
+import functools
 import warnings
 import importlib
 import concurrent.futures
@@ -16,6 +17,8 @@ import psycopg2.extras
 import psycopg2.sql
 import psycopg2.extensions
 import psycopg2.errors
+
+from .json_tools import CustomJsonEncoder
 
 
 def db_connect(address, timeout, on_connect=None):
@@ -156,10 +159,11 @@ class CBStorage(object):
     """
     
     def __init__(self, db_path, table_name, timeout=120.0, connect_timeout=4.0,
-                 mode="rw"):
+                 mode="rw", dumps=None):
         self.db_path = db_path
         self.table_name = table_name
         self.mode = mode
+        self.dumps = functools.partial(json.dumps, cls=CustomJsonEncoder) if dumps is None else dumps
         
         self.sql = SQL(db_path, timeout=timeout, connect_timeout=connect_timeout,
                        on_connect=self._get_on_connect())
@@ -265,7 +269,8 @@ class CBStorage(object):
             _query += "update %s set "\
                       "json=jsonb_set(json, '{%s}', json->'%s' || %%(%s)s)"\
                       "where id=%d;\n" % (self.table_name, _pn, _pn, _pn, block_id)
-        _res = self.sql(_query, {_pn: psycopg2.extras.Json(_val) for _pn, _val in patches.items()},
+        _res = self.sql(_query, {_pn: psycopg2.extras.Json(_val, dumps=self.dumps)
+                                 for _pn, _val in patches.items()},
                         timeout=timeout)
         return
 
@@ -280,13 +285,13 @@ class CBStorage(object):
         if block_id is None:
             query = "insert into %s (json)" \
                     " values (%%(json_value)s) returning id;" % self.table_name
-            ids = self.sql(query, dict(json_value=psycopg2.extras.Json(block_json)),
+            ids = self.sql(query, dict(json_value=psycopg2.extras.Json(block_json, dumps=self.dumps)),
                            timeout=timeout).to_pandas()
             return ids['id'].values
         else:
             query = "update %s set json=%%(json_value)s, "\
                     "update_date=current_timestamp where id=%%(block_id)s;" % self.table_name
-            self.sql(query, dict(json_value=psycopg2.extras.Json(block_json),
+            self.sql(query, dict(json_value=psycopg2.extras.Json(block_json, dumps=self.dumps),
                                  timeout=timeout, block_id=block_id))
             return [block_id]
 
@@ -328,14 +333,14 @@ class CBStorage(object):
         if block_id is None:
             query = "insert into %s (json, bin)" \
                     " values (%%(json_value)s, %%(bin_value)s) returning id;" % self.table_name
-            ids = self.sql(query, dict(json_value=psycopg2.extras.Json(block_json),
+            ids = self.sql(query, dict(json_value=psycopg2.extras.Json(block_json, dumps=self.dumps),
                                        bin_value=psycopg2.Binary(block_binary)),
                            timeout=timeout).to_pandas()
             return ids['id'].values
         else:
             query = "update %s set json=%%(json_value)s, bin=%%(bin_value)s, "\
                     "update_date=current_timestamp where id=%%(block_id)s;" % self.table_name
-            self.sql(query, dict(json_value=psycopg2.extras.Json(block_json),
+            self.sql(query, dict(json_value=psycopg2.extras.Json(block_json, dumps=self.dumps),
                                  bin_value=psycopg2.Binary(block_binary),
                                  block_id=block_id), timeout=timeout)
             return [block_id]
