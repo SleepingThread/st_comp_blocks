@@ -229,7 +229,7 @@ class CBStorage(object):
         return self._load("json", block_id, timeout=timeout)
 
     def load_binary(self, block_id, timeout=None):
-        return self._load("binary", block_id, timeout=timeout)
+        return self._load("bin", block_id, timeout=timeout)
 
     def load(self, block_id, timeout=None):
         return self._load("*", block_id, timeout=timeout)
